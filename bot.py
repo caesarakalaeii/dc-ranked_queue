@@ -259,7 +259,7 @@ class QueueManager():
 
 
 if __name__ == '__main__':
-    bot = QueueManager(BOT_TOKEN, 1137510597114744882, 1137543651401150606, 4, parse_ranking= False)
+    bot = QueueManager(BOT_TOKEN, 1137736500956631091, 1137736261549969488, 6, parse_ranking= False)
     
     bot.runBot()
 
