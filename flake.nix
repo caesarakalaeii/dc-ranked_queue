@@ -204,6 +204,14 @@
       # ======================================================================
       # GENERIC MACHINERY -- byte-identical in all 41 repos, do not edit
       # ======================================================================
+      # ...except that rootPreamble below is, right now, NOT byte-identical to
+      # the other forty. It was the cwd-anchoring bug (see its comment), the fix
+      # is repo-independent, and it belongs in all 41. Until it is there, this
+      # header is aspirational for that one binding -- which is why it says so
+      # rather than letting the next person diff two repos and distrust the
+      # heading. Copy this rootPreamble verbatim into the rest; the only
+      # per-repo work is the `commands` block above, whose verbs must default
+      # their path argument to $REPO_ROOT in whatever way their tool spells it.
 
       # Prepend, never assign: a host LD_LIBRARY_PATH may be carrying something
       # the user needs, and clobbering it breaks binaries they launch from here.
