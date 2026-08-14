@@ -18,9 +18,17 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    # `...` rather than a closed { self, nixpkgs }: adding a second input later
-    # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    # `...` rather than a closed set: adding a second input later would
+    # otherwise fail with "called with unexpected argument '<name>'".
+    #
+    # `self` is bound on purpose. It is this flake's own source snapshot in the
+    # store, and it is the only thing a command can anchor to when it was
+    # invoked as `nix run /path/to/repo#verb` from an unrelated directory --
+    # there is no runtime handle on the work tree in that case. See
+    # rootPreamble. The cost is that touching any tracked file rebuilds the
+    # wrappers (shellcheck reruns, ~1s); the benefit is that no verb can ever
+    # read or write the caller's files.
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -127,24 +135,69 @@
       # house rule there is to spell out "$REPO_ROOT/.venv/bin/python".
       commands = pkgs: {
         lint = {
+          # "''${@:-$REPO_ROOT}" is the whole anchoring rule in one expansion:
+          # explicit paths still win and are still forwarded one-arg-per-arg, but
+          # no arguments means this repo rather than the caller's cwd. ruff walks
+          # a directory itself, so the single anchored path IS the repo. Note the
+          # deliberate absence of a `cd` in the two ruff verbs: the default is
+          # already absolute, and staying put is what keeps a RELATIVE path the
+          # caller typed (`dev-lint bot.py`) meaning what they typed.
+          #
+          # --no-cache closes the last hole in that anchoring: ruff puts
+          # `.ruff_cache/` in its project root, and with no config file to find it
+          # picks the CWD -- so even after the path was anchored, linting from
+          # elsewhere still created a directory in the caller's tree. Pointing
+          # RUFF_CACHE_DIR at $REPO_ROOT instead is not an option: on the store
+          # snapshot ruff exits 2 ("Failed to initialize cache ... Read-only file
+          # system") and reports nothing, which is a lying gate again. Two files
+          # lint in milliseconds, so the cache buys nothing here anyway.
           description = "ruff check";
-          text = ''ruff check "$@"'';
+          text = ''ruff check --no-cache "''${@:-$REPO_ROOT}"'';
         };
         fmt = {
           description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          # The bare-"$@" version of this line rewrote source files in whatever
+          # directory `nix run /path/to/repo#fmt` happened to be called from.
+          # Same anchoring as lint, plus one guard: when we are defaulting to
+          # $REPO_ROOT and that is the store snapshot (no work tree reachable
+          # from here), say so in one line instead of letting ruff emit a
+          # "Failed to write /nix/store/...: Read-only file system" per file.
+          # Explicit paths skip the guard -- forwarding them is the contract.
+          # --no-cache for the same reason as lint: `ruff format` writes the same
+          # cwd-relative .ruff_cache/ that `ruff check` does.
+          text = ''
+            if [ "$#" -eq 0 ] && [ ! -w "$REPO_ROOT" ]; then
+              echo "dev-fmt: $REPO_ROOT is not writable, so there is nothing here to rewrite." >&2
+              echo "dev-fmt: that is this flake's store snapshot, which is what \$REPO_ROOT falls back to" >&2
+              echo "dev-fmt: when no work tree for this repo is reachable from the cwd." >&2
+              echo "dev-fmt: run it from inside the repo, or pass the paths to format explicitly." >&2
+              exit 1
+            fi
+            ruff format --no-cache "''${@:-$REPO_ROOT}"
+          '';
         };
         run = {
           # $REPO_ROOT, not a bare bot.py: CPython puts the SCRIPT's directory on
           # sys.path, so anchoring the path is also what lets `logger` and
           # `config` import when an agent invokes this from a subdirectory.
           #
+          # The `cd` is not cosmetic. bot.py constructs Logger(file_logging=True),
+          # which opens "baselog_log_<asctime>.txt" RELATIVE TO THE CWD -- that is
+          # what .gitignore's `*baselog*` line is for. Without the cd, `nix run
+          # /path/to/repo#run` drops the bot's logs in the caller's directory.
+          #
           # config.py is gitignored (see .gitignore's `*config*`) and holds
           # BOT_TOKEN plus the channel IDs, so this verb needs one to exist
           # locally and fails with a plain ImportError until it does. Nothing in
-          # a flake can supply a Discord token.
+          # a flake can supply a Discord token -- and, because it is gitignored,
+          # nothing puts it in the store snapshot either, so this verb only ever
+          # really starts from a work tree. That is the honest boundary: from
+          # anywhere else it stops on the missing import instead of half-running.
           description = "start the queue bot (needs a local, gitignored config.py)";
-          text = ''python "$REPO_ROOT/bot.py" "$@"'';
+          text = ''
+            cd "$REPO_ROOT"
+            python "$REPO_ROOT/bot.py" "$@"
+          '';
         };
       };
 
@@ -162,12 +215,37 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # Every command gets $REPO_ROOT, and $REPO_ROOT is the ONLY thing a verb
+      # may touch when it was given no arguments. `nix run` and `nix develop`
+      # both start in whatever directory they were invoked from, so a verb that
+      # defaults to `.` -- or to a bare `"$@"`, which is the same thing to every
+      # tool here -- reads and REWRITES the caller's files. That was not
+      # theoretical: `nix run /path/to/repo#fmt` from an unrelated directory
+      # reformatted that directory, and `#lint` reported that directory's
+      # findings (none at all, exit 0, in an empty one) while this repo's 29 went
+      # unlooked-at. The flake-URL form is exactly what CI and a cold agent use.
+      #
+      # Resolution order. Offline, and both candidates are inside this repo:
+      #   1. the git work tree we are standing in, but ONLY if it is THIS repo,
+      #      proven by its flake.nix being byte-identical to the one this wrapper
+      #      was built from. "Am I in some git repo" is not a check -- it is the
+      #      bug above wearing a hat, and it is what makes a mutating verb pick
+      #      a stranger's directory as its victim.
+      #   2. otherwise ${self}: this flake's source snapshot in the store. It is
+      #      the right answer for a read-only verb (same files, same findings as
+      #      inside the repo) and the right failure for a mutating one -- ruff
+      #      stops on "Read-only file system" instead of guessing.
+      #
+      # `$(<f)` rather than cmp/diff: a bash builtin, so this needs nothing on
+      # PATH that runtimeInputs does not already guarantee.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        REPO_ROOT="${self}"
+        if _top="$(git rev-parse --show-toplevel 2>/dev/null)" &&
+          [ -f "$_top/flake.nix" ] &&
+          [ "$(<"$_top/flake.nix")" = "$(<"${self}/flake.nix")" ]; then
+          REPO_ROOT="$_top"
+        fi
+        unset _top
         export REPO_ROOT
       '';
 
